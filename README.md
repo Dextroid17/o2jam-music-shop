@@ -13,10 +13,14 @@ This repo fixes that, with two pieces:
    client asks for, and a small client patch teaches the shop to speak HTTP instead of FTP.
 
 Song names that were only ever stored in Korean / Japanese / Chinese are **translated to
-English, with the original language in parentheses** - e.g. `Umbrella (Korean)`,
-`Nunchaku (Chinese)`, `Tori no Uta (Japanese)`. The game's own font has no CJK glyphs, so
-those titles used to draw as empty boxes; the English form fixes that everywhere (shop list,
-song list, catalogue). The same treatment is applied to artist and note-arranger names.
+English, with the original language in parentheses** - e.g. `Umbrella (Feat. Younha) (KO)`,
+`Nunchaku (CN)`, `Tori no Uta (JP)`. The game's own font has no CJK glyphs, so those titles
+used to draw as empty boxes; the English form fixes that everywhere (shop list, song list,
+catalogue). The same treatment is applied to artist and note-arranger names.
+
+The language tags are deliberately **two letters** - `(KO)` `(CN)` `(JP)`. The in-game MY MUSIC
+list only has room for about 30 characters per row, so the short form buys back five characters
+and stops long titles from clipping with an ellipsis.
 
 Result: the in-game shop really downloads songs, and they become playable straight away.
 
