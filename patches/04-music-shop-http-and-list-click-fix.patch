@@ -1,0 +1,371 @@
+diff --git a/include/CXO2/Services/MusicDownloaderService.hpp b/include/CXO2/Services/MusicDownloaderService.hpp
+index b4cda38..4d872c4 100644
+--- a/include/CXO2/Services/MusicDownloaderService.hpp
++++ b/include/CXO2/Services/MusicDownloaderService.hpp
+@@ -81,6 +81,7 @@ namespace Cx
+         };
+ 
+         void DownloadProc();
++        void DownloadProcHttp(const std::vector<DownloadItem>& items, const std::string& host, unsigned short port, const std::string& base);
+         void Fail(MusicDownloadError error);
+ 
+         CommandLineContext& m_args;
+diff --git a/src/CXO2/Services/MusicDownloaderService.cpp b/src/CXO2/Services/MusicDownloaderService.cpp
+index eb8b80b..da842f4 100644
+--- a/src/CXO2/Services/MusicDownloaderService.cpp
++++ b/src/CXO2/Services/MusicDownloaderService.cpp
+@@ -5,10 +5,12 @@
+ 
+ #include <SFML/Network/Dns.hpp>
+ #include <SFML/Network/Ftp.hpp>
++#include <SFML/Network/Http.hpp>
+ #include <SFML/Network/Sftp.hpp>
+ #include <SFML/System/Clock.hpp>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <optional>
+@@ -46,6 +48,59 @@ namespace Cx
+             return name;
+         }
+ 
++        // --- Music Shop over HTTP ------------------------------------------------
++        // The launcher may expose the song catalogue through a plain HTTP server
++        // (O2JAM_SHOP_URL=http://host:port[/base]).  When it is set, the shop
++        // downloads from <url>/Patch/MUSIC/o2ma<ID>.ojn|.ojm instead of the
++        // original anonymous FTP/SFTP patch server, so songs can be served from
++        // a local directory, a NAS or any static web host.
++        struct ShopEndpoint
++        {
++            std::string Host;
++            unsigned short Port = 80;
++            std::string Base;
++        };
++
++        std::optional<ShopEndpoint> ResolveShopEndpoint(const CommandLineContext& args)
++        {
++            auto url = std::string();
++            if (const auto* env = std::getenv("O2JAM_SHOP_URL"); env != nullptr && *env != '\0')
++                url = env;
++            else if (const auto ftp = args.GetFtpUrl(); ftp.rfind("http://", 0) == 0)
++                url = ftp;
++
++            if (url.empty())
++                return std::nullopt;
++
++            if (url.rfind("http://", 0) == 0)
++                url = url.substr(7);
++
++            auto endpoint = ShopEndpoint();
++            const auto slash = url.find('/');
++            endpoint.Base = slash == std::string::npos ? std::string() : url.substr(slash);
++
++            const auto hostPort = url.substr(0, slash);
++            if (hostPort.empty())
++                return std::nullopt;
++
++            if (const auto colon = hostPort.rfind(':'); colon != std::string::npos)
++            {
++                endpoint.Host = hostPort.substr(0, colon);
++                try
++                {
++                    endpoint.Port = static_cast<unsigned short>(std::stoi(hostPort.substr(colon + 1)));
++                }
++                catch (...)
++                {
++                    return std::nullopt;
++                }
++            }
++            else
++                endpoint.Host = hostPort;
++
++            return endpoint.Host.empty() ? std::nullopt : std::optional<ShopEndpoint>(endpoint);
++        }
++
+         void WriteFileInfo(const std::filesystem::path& path, const std::vector<FileEntry>& entries)
+         {
+             auto file = std::ofstream(path, std::ios::trunc);
+@@ -266,6 +321,14 @@ namespace Cx
+             return;
+         }
+ 
++        // Music Shop over HTTP: when O2JAM_SHOP_URL is set (or the FTP argument is an
++        // http:// URL) the songs come from a static web server instead of the FTP one.
++        if (const auto shop = ResolveShopEndpoint(m_args))
++        {
++            DownloadProcHttp(items, shop->Host, shop->Port, shop->Base);
++            return;
++        }
++
+         auto url = m_args.GetFtpUrl();
+         if (const auto separator = url.find('/'); separator != std::string::npos)
+             url = url.substr(0, separator);
+@@ -597,4 +660,216 @@ namespace Cx
+         m_cancelled = false;
+         m_running   = false;
+     }
++
++    // Download a batch of songs from a static HTTP Music Shop (see ResolveShopEndpoint).
++    // Layout expected on the server: <base>/Patch/MUSIC/o2ma<ID>[_<version>].ojn and
++    // <base>/Patch/MUSIC/o2ma<ID>.ojm — the same paths the original patch server used.
++    void MusicDownloaderService::DownloadProcHttp(const std::vector<DownloadItem>& items, const std::string& host, const unsigned short port, const std::string& base)
++    {
++        auto http = sf::Http();
++        if (!http.setHost(host, port))
++        {
++            Fail(MusicDownloadError::ConnectionFailed);
++            return;
++        }
++
++        const auto remoteDir = std::filesystem::path(base) / RemoteDirectory;
++        const auto encode    = [](const std::filesystem::path& path)
++        {
++            return "/" + path.generic_string();
++        };
++
++        const auto getRemoteSize = [&](const std::string& name) -> std::optional<std::uint64_t>
++        {
++            const auto request  = sf::Http::Request(encode(remoteDir / name), sf::Http::Request::Method::Head);
++            const auto response = http.sendRequest(request, TransferTimeout);
++            if (response.getStatus() != sf::Http::Response::Status::Ok)
++                return std::nullopt;
++
++            try
++            {
++                return static_cast<std::uint64_t>(std::stoull(response.getField("Content-Length")));
++            }
++            catch (...)
++            {
++                return std::nullopt;
++            }
++        };
++
++        auto queue = std::vector<std::vector<FileEntry>>();
++        std::uint64_t totalSize = 0;
++        for (const auto& item : items)
++        {
++            const auto ojn = GetTempFileName(item.MusicID, item.Version) + ".ojn";
++            const auto ojm = GetTempFileName(item.MusicID, 0) + ".ojm";
++
++            const auto ojnSize = getRemoteSize(ojn);
++            const auto ojmSize = getRemoteSize(ojm);
++            if (!ojnSize.has_value() || !ojmSize.has_value())
++            {
++                Fail(MusicDownloadError::ConnectionFailed);
++                return;
++            }
++
++            totalSize += *ojnSize + *ojmSize;
++            queue.push_back({{ojn, *ojnSize, 0}, {ojm, *ojmSize, 0}});
++        }
++
++        auto error = std::error_code();
++        if (const auto space = std::filesystem::space(".", error); !error && space.available < totalSize)
++        {
++            Fail(MusicDownloadError::InsufficientDiskSpace);
++            return;
++        }
++
++        {
++            auto lock = std::lock_guard(m_mutex);
++            m_progress.Status    = MusicDownloadStatus::Downloading;
++            m_progress.TotalSize = totalSize;
++        }
++
++        std::filesystem::create_directories(TempDirectory, error);
++
++        for (std::size_t index = 0; index < items.size(); index++)
++        {
++            const auto& item    = items[index];
++            auto&       entries = queue[index];
++            const auto  iniPath = std::filesystem::path(TempDirectory) / (GetTempFileName(item.MusicID, item.Version) + ".ini");
++
++            {
++                auto lock = std::lock_guard(m_mutex);
++                m_progress.QueueIndex = index;
++                m_progress.MusicID    = item.MusicID;
++                m_progress.MusicTitle = item.Title;
++                m_notifications.push_back({Notification::Type::DownloadStarted, item.MusicID, MusicDownloadError::None});
++            }
++
++            WriteFileInfo(iniPath, entries);
++
++            auto failure = std::optional<MusicDownloadError>();
++            for (auto& entry : entries)
++            {
++                const auto tempPath  = std::filesystem::path(TempDirectory) / (entry.Name + "_");
++                const auto localPath = std::filesystem::path(MusicDirectory) / entry.Name;
++
++                if (m_cancelled)
++                {
++                    failure = MusicDownloadError::Cancelled;
++                    break;
++                }
++
++                // Already installed with the expected size: nothing to transfer.
++                auto matchError = std::error_code();
++                if (std::filesystem::is_regular_file(localPath, matchError) &&
++                    std::filesystem::file_size(localPath, matchError) == entry.Size && !matchError)
++                {
++                    entry.Status = 4;
++                    WriteFileInfo(iniPath, entries);
++
++                    auto lock = std::lock_guard(m_mutex);
++                    m_progress.FileBytesRead   = entry.Size;
++                    m_progress.TotalBytesRead += entry.Size;
++                    continue;
++                }
++
++                entry.Status = 0;
++                WriteFileInfo(iniPath, entries);
++                std::filesystem::remove(tempPath, error);
++
++                {
++                    auto lock = std::lock_guard(m_mutex);
++                    m_progress.FileName       = entry.Name;
++                    m_progress.FileSize       = entry.Size;
++                    m_progress.FileBytesRead  = 0;
++                }
++
++                const auto request  = sf::Http::Request(encode(remoteDir / entry.Name), sf::Http::Request::Method::Get);
++                const auto clock    = sf::Clock();
++                const auto response = http.sendRequest(request, TransferTimeout);
++
++                bool success = false;
++                if (response.getStatus() == sf::Http::Response::Status::Ok)
++                {
++                    const auto& body = response.getBody();
++                    if (auto file = std::ofstream(tempPath, std::ios::binary | std::ios::trunc))
++                    {
++                        file.write(body.data(), static_cast<std::streamsize>(body.size()));
++                        success = file.good() && !m_cancelled && body.size() == entry.Size;
++                    }
++
++                    const auto elapsed = std::max(clock.getElapsedTime().asSeconds(), 0.001f);
++                    auto lock = std::lock_guard(m_mutex);
++                    m_progress.BytesPerSecond = static_cast<std::uint64_t>(body.size() / elapsed);
++                }
++
++                if (!success)
++                {
++                    failure = MusicDownloadError::DownloadFailed;
++                    break;
++                }
++
++                entry.Status = 4;
++                WriteFileInfo(iniPath, entries);
++
++                {
++                    auto lock = std::lock_guard(m_mutex);
++                    m_progress.FileBytesRead   = entry.Size;
++                    m_progress.TotalBytesRead += entry.Size;
++                }
++            }
++
++            if (failure.has_value())
++            {
++                for (const auto& entry : entries)
++                {
++                    auto cleanupError = std::error_code();
++                    std::filesystem::remove(std::filesystem::path(TempDirectory) / (entry.Name + "_"), cleanupError);
++                    std::filesystem::remove(std::filesystem::path(TempDirectory) / entry.Name, cleanupError);
++                }
++
++                std::filesystem::remove(iniPath, error);
++                std::filesystem::remove(TempDirectory, error);
++
++                Fail(*failure);
++                return;
++            }
++
++            {
++                auto lock = std::lock_guard(m_mutex);
++                m_notifications.push_back({Notification::Type::Renaming, item.MusicID, MusicDownloadError::None});
++            }
++
++            for (const auto& entry : entries)
++            {
++                const auto tempPath  = std::filesystem::path(TempDirectory) / (entry.Name + "_");
++                const auto localPath = std::filesystem::path(MusicDirectory) / entry.Name;
++
++                auto moveError = std::error_code();
++                if (std::filesystem::exists(localPath, moveError))
++                    std::filesystem::remove(tempPath, moveError);
++                else
++                    std::filesystem::rename(tempPath, localPath, moveError);
++            }
++
++            std::filesystem::remove(iniPath, error);
++
++            {
++                auto lock = std::lock_guard(m_mutex);
++                m_notifications.push_back({Notification::Type::DownloadCompleted, item.MusicID, MusicDownloadError::None});
++            }
++        }
++
++        std::filesystem::remove(TempDirectory, error);
++
++        {
++            auto lock = std::lock_guard(m_mutex);
++            m_queue.clear();
++            m_progress = MusicDownloadProgress();
++            m_progress.Status = MusicDownloadStatus::Completed;
++            m_notifications.push_back({Notification::Type::QueueCompleted, 0, MusicDownloadError::None});
++        }
++
++        m_cancelled = false;
++        m_running   = false;
++    }
+ }
+diff --git a/src/CXO2/States/StateMusicShop.cpp b/src/CXO2/States/StateMusicShop.cpp
+index cdf3a6c..d5e78fd 100644
+--- a/src/CXO2/States/StateMusicShop.cpp
++++ b/src/CXO2/States/StateMusicShop.cpp
+@@ -111,11 +111,15 @@ namespace Cx
+                 selector->SetVisible(false);
+                 item->SetFocusChangedCallback([this] (auto& sender, auto& ev) { OnMusicItemFocusChanged(sender, ev); });
+ 
++                // The row itself toggles the download queue. Register it unconditionally: the
++                // tick-box child may not exist yet at construction time (it is created from the
++                // item template), and gating the row callback on it left every row unclickable.
++                item->SetClickCallback([this] (auto& sender, auto& ev) { OnMusicItemClicked(sender, ev); });
++
+                 if (const auto toggleButton = item->FindChild<Cx::ToggleButton>(Resource::MusicShop::MusicItem::IDC_TOGGLE_SELECT))
+                 {
+                     toggleButton->SetClickCallback([this] (auto& sender, auto& ev) { OnMusicItemToggleClicked(sender, ev); });
+                     toggleButton->SetFocusChangedCallback([this] (auto& sender, auto& ev) { OnMusicItemToggleFocusChanged(sender, ev); });
+-                    item->SetClickCallback([this] (auto& sender, auto& ev) { OnMusicItemClicked(sender, ev); });
+                 }
+             }
+         }
+@@ -676,6 +680,10 @@ namespace Cx
+ 
+     void StateMusicShop::OnMusicItemToggleClicked(Control& sender, Control::Event& ev)
+     {
++        // Ticking the box must enqueue/dequeue too: forward the click to the row handler.
++        if (const auto item = sender.GetParent<Cx::UiContainer>())
++            OnMusicItemClicked(*item, ev);
++
+         ev.Handled = true; // Use item click callback
+     }
+ 
+@@ -687,7 +695,16 @@ namespace Cx
+ 
+     void StateMusicShop::OnMusicItemClicked(Control& sender, Control::Event& ev)
+     {
+-        const auto index = m_musicItemIndices.find(&sender);
++        // A click can arrive from the row container or from one of its children (labels, the
++        // tick box): walk up until we find the slot that InvalidateMusicList registered.
++        auto slot  = &sender;
++        auto index = m_musicItemIndices.find(slot);
++        while (index == m_musicItemIndices.end() && slot != nullptr)
++        {
++            slot  = slot->GetParent<Cx::UiContainer>();
++            index = slot != nullptr ? m_musicItemIndices.find(slot) : m_musicItemIndices.end();
++        }
++
+         if (index == m_musicItemIndices.end())
+             return;
+ 

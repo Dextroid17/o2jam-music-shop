@@ -1,0 +1,9 @@
+*.ojn
+*.ojm
+*.ogg
+*.mp3
+Patch/
+shop-server.log
+shop-server.pid
+__pycache__/
+*.pyc
