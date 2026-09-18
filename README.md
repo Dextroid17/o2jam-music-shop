@@ -1,5 +1,7 @@
 # O2Jam Music Shop 🎵
 
+![Vinyl record and headphones in neon, retro arcade style](docs/assets/readme-hero.png)
+
 Ever opened the **MUSIC SHOP** in the offline O2Jam client, seen 100+ pages of songs, pressed
 **DOWN!** … and nothing happened? That is because the shop fetches songs from the old patch
 server over FTP/SFTP, and that server has been gone for years.
